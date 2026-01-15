@@ -307,6 +307,61 @@ def denoise(
     return img
 
 
+def vanilla_guidance(x: torch.Tensor, cfg_val: float) -> torch.Tensor:
+    x_u, x_c = x.chunk(2)
+    x = x_u + cfg_val * (x_c - x_u)
+    return x
+
+
+def denoise_cfg(
+    model: Flux2,
+    img: Tensor,
+    img_ids: Tensor,
+    txt: Tensor,  # Already cat([txt_empty, txt_prompt])
+    txt_ids: Tensor,
+    timesteps: list[float],
+    guidance: float,
+    img_cond_seq: Tensor | None = None,
+    img_cond_seq_ids: Tensor | None = None,
+):
+    img = torch.cat([img, img], dim=0)
+    img_ids = torch.cat([img_ids, img_ids], dim=0)
+
+    if img_cond_seq is not None:
+        assert img_cond_seq_ids is not None
+        img_cond_seq = torch.cat([img_cond_seq, img_cond_seq], dim=0)
+        img_cond_seq_ids = torch.cat([img_cond_seq_ids, img_cond_seq_ids], dim=0)
+
+    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+
+        img_input = img
+        img_input_ids = img_ids
+        if img_cond_seq is not None:
+            img_input = torch.cat((img_input, img_cond_seq), dim=1)
+            img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
+
+        pred = model(
+            x=img_input,
+            x_ids=img_input_ids,
+            timesteps=t_vec,
+            ctx=txt,
+            ctx_ids=txt_ids,
+            guidance=None,
+        )
+
+        if img_cond_seq is not None:
+            pred = pred[:, : img.shape[1]]
+
+        pred_uncond, pred_cond = pred.chunk(2)
+        pred = pred_uncond + guidance * (pred_cond - pred_uncond)
+        pred = torch.cat([pred, pred], dim=0)
+
+        img = img + (t_prev - t_curr) * pred
+
+    return img.chunk(2)[0]
+
+
 def concatenate_images(
     images: list[Image.Image],
 ) -> Image.Image:

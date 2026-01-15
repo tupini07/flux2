@@ -17,6 +17,7 @@ dependencies = [
   "safetensors==0.4.5",
   "fire==0.7.1",
   "openai==2.8.1",
+  "accelerate==1.12.0",
 ]
 
 [project.optional-dependencies]
