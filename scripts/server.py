@@ -28,7 +28,6 @@ Endpoint:
 
 import asyncio
 import io
-import os
 import random
 import sys
 from typing import List, Optional
@@ -49,7 +48,7 @@ from flux2.sampling import (
     get_schedule,
     scatter_ids,
 )
-from flux2.util import FLUX2_MODEL_INFO, load_ae, load_flow_model, load_text_encoder
+from flux2.util import FLUX2_MODEL_INFO, load_ae, load_flow_model
 
 app = FastAPI(title="Flux.2 Generation Server")
 
@@ -69,17 +68,119 @@ _queue: asyncio.Queue = asyncio.Queue()
 _queue_lock: asyncio.Lock = asyncio.Lock()
 
 
-def _shard_flow_model(model, gpu_ids: list[int]):
-    """Shard the Flux2 flow model across the given GPUs using accelerate."""
-    from accelerate import dispatch_model, infer_auto_device_map
-    from accelerate.utils import get_balanced_memory
+def _shard_flow_model_manual(model, gpu_ids: list[int]):
+    """
+    Manually shard Flux2 across GPUs by moving submodules.
 
-    max_memory = {i: torch.cuda.get_device_properties(i).total_mem for i in gpu_ids}
-    max_memory = get_balanced_memory(model, max_memory=max_memory, dtype=torch.bfloat16)
-    device_map = infer_auto_device_map(model, max_memory=max_memory, dtype=torch.bfloat16)
-    model = dispatch_model(model, device_map=device_map)
-    print(f"  Flow model sharded across GPUs {gpu_ids}: {set(device_map.values())}")
+    Flux2.forward precomputes modulation vectors (vec, mods) on the first GPU,
+    then passes them to every block. accelerate.dispatch_model can't handle this
+    broadcast pattern, so we wrap forward to move tensors between devices.
+
+    Layout: embeddings + double_blocks on gpu_ids[0],
+            single_blocks + final_layer on gpu_ids[1].
+    """
+    dev0 = torch.device(f"cuda:{gpu_ids[0]}")
+    dev1 = torch.device(f"cuda:{gpu_ids[1]}")
+
+    # Embeddings + modulations + double blocks stay on first GPU (already there)
+    model.pe_embedder.to(dev0)
+    model.img_in.to(dev0)
+    model.txt_in.to(dev0)
+    model.time_in.to(dev0)
+    if hasattr(model, "guidance_in"):
+        model.guidance_in.to(dev0)
+    model.double_stream_modulation_img.to(dev0)
+    model.double_stream_modulation_txt.to(dev0)
+    model.single_stream_modulation.to(dev0)
+    model.double_blocks.to(dev0)
+
+    # Single blocks + final layer on second GPU
+    model.single_blocks.to(dev1)
+    model.final_layer.to(dev1)
+
+    # Patch forward to handle device transitions
+    _orig_forward = model.forward
+
+    def _sharded_forward(x, x_ids, timesteps, ctx, ctx_ids, guidance):
+        num_txt_tokens = ctx.shape[1]
+
+        from flux2.model import timestep_embedding
+
+        timestep_emb = timestep_embedding(timesteps, 256)
+        vec = model.time_in(timestep_emb)
+        if model.use_guidance_embed:
+            guidance_emb = timestep_embedding(guidance, 256)
+            vec = vec + model.guidance_in(guidance_emb)
+
+        double_block_mod_img = model.double_stream_modulation_img(vec)
+        double_block_mod_txt = model.double_stream_modulation_txt(vec)
+        single_block_mod, _ = model.single_stream_modulation(vec)
+
+        img = model.img_in(x)
+        txt = model.txt_in(ctx)
+        pe_x = model.pe_embedder(x_ids)
+        pe_ctx = model.pe_embedder(ctx_ids)
+
+        for block in model.double_blocks:
+            img, txt = block(img, txt, pe_x, pe_ctx, double_block_mod_img, double_block_mod_txt)
+
+        # Move to second GPU for single blocks
+        img = torch.cat((txt, img), dim=1).to(dev1)
+        pe = torch.cat((pe_ctx, pe_x), dim=2).to(dev1)
+        single_block_mod = tuple(t.to(dev1) for t in single_block_mod)
+        vec_dev1 = vec.to(dev1)
+
+        for block in model.single_blocks:
+            img = block(img, pe, single_block_mod)
+
+        img = img[:, num_txt_tokens:, ...]
+        img = model.final_layer(img, vec_dev1)
+        # Move output back to first GPU
+        return img.to(dev0)
+
+    model.forward = _sharded_forward
+    print(
+        f"  Flow model manually sharded: double_blocks on cuda:{gpu_ids[0]}, single_blocks on cuda:{gpu_ids[1]}"
+    )
     return model
+
+
+def _load_text_encoder_sharded(model_name: str, gpu_ids: list[int]):
+    """Load the Mistral text encoder sharded across multiple GPUs via device_map."""
+    from transformers import AutoProcessor, Mistral3ForConditionalGeneration, pipeline
+
+    from flux2.text_encoder import (
+        MAX_LENGTH,
+        Mistral3SmallEmbedder,
+        UPSAMPLING_MAX_IMAGE_SIZE,
+    )
+
+    # Build max_memory dict restricting to only our target GPUs
+    max_memory = {i: f"{torch.cuda.get_device_properties(i).total_memory // (1024**3)}GiB" for i in gpu_ids}
+
+    embedder = Mistral3SmallEmbedder.__new__(Mistral3SmallEmbedder)
+    torch.nn.Module.__init__(embedder)
+
+    print(f"  Loading Mistral model with device_map across GPUs {gpu_ids}...")
+    embedder.model = Mistral3ForConditionalGeneration.from_pretrained(
+        "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        max_memory=max_memory,
+    )
+    embedder.processor = AutoProcessor.from_pretrained(
+        "mistralai/Mistral-Small-3.1-24B-Instruct-2503", use_fast=False
+    )
+    embedder.yes_token, embedder.no_token = embedder.processor.tokenizer.encode(
+        ["yes", "no"], add_special_tokens=False
+    )
+    embedder.max_length = MAX_LENGTH
+    embedder.upsampling_max_image_size = UPSAMPLING_MAX_IMAGE_SIZE
+    # NSFW classifier is small — put on the first text encoder GPU
+    embedder.nsfw_classifier = pipeline(
+        "image-classification", model="Falconsai/nsfw_image_detection", device=f"cuda:{gpu_ids[0]}"
+    )
+    return embedder
 
 
 def load_models(
@@ -97,27 +198,29 @@ def load_models(
 
     if num_gpus >= 4:
         flow_gpus = [0, 1]
-        te_device = "cuda:2"
+        te_gpus = [2, 3]
         ae_dev = "cuda:0"
         _cpu_offloading = False
-        # Set CUDA_VISIBLE_DEVICES-like constraint for the text encoder
-        # HF from_pretrained device_map="auto" will pick available GPUs,
-        # so we set the device explicitly for the embedder wrapper.
-        os.environ["FLUX_TE_DEVICE"] = te_device
     elif num_gpus >= 2:
         flow_gpus = [0]
-        te_device = f"cuda:{num_gpus - 1}"
+        te_gpus = list(range(1, num_gpus))
         ae_dev = "cuda:0"
         _cpu_offloading = False
     else:
         flow_gpus = []
-        te_device = "cuda:0"
+        te_gpus = [0]
         ae_dev = "cuda:0"
         _cpu_offloading = True
 
     # --- Text encoder ---
-    print(f"Loading text encoder for {model_name} on {te_device}...")
-    _text_encoder = load_text_encoder(model_name, device=te_device)
+    if len(te_gpus) >= 2:
+        print(f"Loading text encoder for {model_name} across GPUs {te_gpus}...")
+        _text_encoder = _load_text_encoder_sharded(model_name, te_gpus)
+    else:
+        from flux2.util import load_text_encoder
+
+        print(f"Loading text encoder for {model_name} on cuda:{te_gpus[0]}...")
+        _text_encoder = load_text_encoder(model_name, device=f"cuda:{te_gpus[0]}")
     _text_encoder.eval()
 
     # --- Flow model ---
@@ -128,7 +231,7 @@ def load_models(
     elif len(flow_gpus) >= 2:
         print(f"Loading flow model for {model_name}, will shard across GPUs {flow_gpus}...")
         _model = load_flow_model(model_name, debug_mode=debug_mode, device=f"cuda:{flow_gpus[0]}")
-        _model = _shard_flow_model(_model, flow_gpus)
+        _model = _shard_flow_model_manual(_model, flow_gpus)
         _flow_device = torch.device(f"cuda:{flow_gpus[0]}")
     else:
         dev = f"cuda:{flow_gpus[0]}"
